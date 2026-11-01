@@ -1,0 +1,33 @@
+#!/bin/bash
+# Kiro CLI + Kiro Crew を AL2023 にセットアップし、crew ユーザーの systemd サービスで常駐させる。
+set -euxo pipefail
+exec > >(tee /var/log/kiro-crew-setup.log | logger -t kiro-crew-setup) 2>&1
+
+# bubblewrap と socat は Kiro CLI のローカルサンドボックス(bwrap)用
+dnf install -y git tar gzip python3.12 jq bubblewrap socat
+dnf install -y nodejs20 awscli-2 || true
+useradd -m -s /bin/bash crew || true
+loginctl enable-linger crew || true
+
+# Kiro CLI(公式インストーラ)
+su - crew -c 'curl -fsSL https://cli.kiro.dev/install | bash'
+# Kiro Crew(ワンライナー。管理 venv + KAS エンジン)
+su - crew -c 'curl -fsSL https://download.crew.kiro.dev/cli.sh | KIROCREW_INSTALL_PLAIN=1 sh -s -- --channel ${crew_channel}'
+
+# 任意: API キーを SSM SecureString から取り出して .env に置く(ヘッドレス用)
+%{ if api_key_param != "" ~}
+KEY=$(aws ssm get-parameter --region ${region} --name "${api_key_param}" --with-decryption --query Parameter.Value --output text)
+install -d -m 700 -o crew -g crew /home/crew/.kiro/crew
+printf 'KIRO_API_KEY=%s\n' "$KEY" > /home/crew/.kiro/crew/.env
+chown crew:crew /home/crew/.kiro/crew/.env && chmod 600 /home/crew/.kiro/crew/.env
+%{ endif ~}
+
+# 初期設定と常駐化(ダッシュボードは loopback のみ。SSM ポートフォワードで開く)
+su - crew -c 'export PATH=$HOME/.local/bin:$PATH && kirocrew setup --agent-only --clean || true'
+su - crew -c 'export PATH=$HOME/.local/bin:$PATH && kirocrew doctor || true'
+# service install は内部で sudo を使うため、一時的に crew に NOPASSWD を与えて実行し、終わったら外す
+echo 'crew ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-crew-setup && chmod 440 /etc/sudoers.d/90-crew-setup
+sudo -u crew env PATH=/home/crew/.local/bin:$PATH HOME=/home/crew kirocrew service install || true
+rm -f /etc/sudoers.d/90-crew-setup
+systemctl enable --now kirocrew 2>/dev/null || true
+echo "kiro-crew setup done"
